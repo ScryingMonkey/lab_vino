@@ -1,0 +1,1 @@
+CALL "c:\Program Files (x86)\IntelSWTools\openvino\bin\setupvars.bat" -pyver 3.5
