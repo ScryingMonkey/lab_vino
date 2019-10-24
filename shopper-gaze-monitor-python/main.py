@@ -34,41 +34,37 @@ from threading import Thread
 from collections import namedtuple
 from argparse import ArgumentParser
 from inference import Network
+from loghelper import LogHelper as lh
 
-# shoppingInfo contains statistics for the shopping information
-MyStruct = namedtuple("shoppingInfo", "shoppers, lookers, attenders, totalSessions")
-INFO = MyStruct(0, 0, 0, 0)
-
-# paths to the various trained models
-MODEL_PATH_ROOT = "C:\Program Files (x86)\IntelSWTools\openvino\deployment_tools\\tools\model_downloader"
-FACE_DETECTION = f"{MODEL_PATH_ROOT}\\Transportation\\object_detection\\face\\pruned_mobilenet_reduced_ssd_shared_weights\\dldt\\INT8\\face-detection-adas-0001.xml"
-HEAD_POSITION = f"{MODEL_PATH_ROOT}\\Transportation\\object_attributes\\headpose\\vanilla_cnn\\dldt\\INT8\\head-pose-estimation-adas-0001.xml"
-FACE_REID = f"{MODEL_PATH_ROOT}\\Retail\\object_reidentification\\face\\mobilenet_based\\dldt\\FP32\\face-reidentification-retail-0095.xml"
-CPU_EXTENSION_PATH = "c:\Program Files (x86)\IntelSWTools\openvino\inference_engine\lib\intel64\Release\inference_engine.lib"
-FACE_DIR = ".\\dataset\\faces"
-OUTPUT_DIR = ".\\output"
+# Environment set up
+MyStruct = namedtuple("shoppingInfo", "faces, lookers, attenders, totalSessions, session")
+INFO = MyStruct(0, 0, 0, 0, False) # shoppingInfo contains statistics for the shopping information
 MyPath = namedtuple("MyPath", "FACE_DETECTION, HEAD_POSITION, FACE_REID, CPU_EXTENSION_PATH, FACE_DIR, OUTPUT_DIR")
-PATH = MyPath(FACE_DETECTION, HEAD_POSITION, FACE_REID, CPU_EXTENSION_PATH, FACE_DIR, OUTPUT_DIR)
-
-# MQTT server environment variables
-# TOPIC = "shopper_gaze_monitor"
-# MQTT_HOST = "localhost"
-# MQTT_PORT = 1883
-# MQTT_KEEPALIVE_INTERVAL = 60
-
-# Flag to control background thread
-KEEP_RUNNING = True
-DELAY = 5
-CURRENT_SESSION_FACE = None
-CURRENT_SESSION_FACEIMAGE = None
-args = None
+def initializePATH():  # setup and return path struct
+    # paths to the various trained models
+    MODEL_PATH_ROOT = "C:\Program Files (x86)\IntelSWTools\openvino\deployment_tools\\tools\model_downloader"
+    FACE_DETECTION = f"{MODEL_PATH_ROOT}\\Transportation\\object_detection\\face\\pruned_mobilenet_reduced_ssd_shared_weights\\dldt\\INT8\\face-detection-adas-0001.xml"
+    HEAD_POSITION = f"{MODEL_PATH_ROOT}\\Transportation\\object_attributes\\headpose\\vanilla_cnn\\dldt\\INT8\\head-pose-estimation-adas-0001.xml"
+    FACE_REID = f"{MODEL_PATH_ROOT}\\Retail\\object_reidentification\\face\\mobilenet_based\\dldt\\FP32\\face-reidentification-retail-0095.xml"
+    # path to device driver
+    CPU_EXTENSION_PATH = "c:\Program Files (x86)\IntelSWTools\openvino\inference_engine\lib\intel64\Release\inference_engine.lib"
+    # paths to image dirs
+    FACE_DIR = ".\\dataset\\faces"
+    OUTPUT_DIR = ".\\output"
+    # MyPath = namedtuple("MyPath", "FACE_DETECTION, HEAD_POSITION, FACE_REID, CPU_EXTENSION_PATH, FACE_DIR, OUTPUT_DIR")
+    return MyPath(FACE_DETECTION, HEAD_POSITION, FACE_REID, CPU_EXTENSION_PATH, FACE_DIR, OUTPUT_DIR)
+PATH = initializePATH() # PATH contatins directory paths to various resources
+def intializeMQTT():  # Set up and return MQTT global variables
+    TOPIC = "shopper_gaze_monitor"
+    MQTT_HOST = "localhost"
+    MQTT_PORT = 1883
+    MQTT_KEEPALIVE_INTERVAL = 60
+    return (TOPIC, MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL)
+#TOPIC, MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL = intializeMQTT(): # Set up MQTT server environment variables
+MyState = namedtuple("MyState", "KEEP_RUNNING, DELAY, FRAMES_SINCE_LAST_LOG, FRAMES_TO_WAIT_BETWEEN_LOGS, CURRENT_SESSION_FACE, CURRENT_SESSION_FACEIMAGE")
+STATE = MyState(True,5,0,100,None,None) # STATE holds vars to control background thread
 logger = log.getLogger() 
 
-def logfunc(f,args):
-    print(f">> running {f.__name__}(")
-    for k in args:
-        print(f"    {k}:{args[k]}")
-    print(")")
 def args_parser():
     """
     Parse command line arguments.
@@ -102,7 +98,7 @@ def initializeInput(input):
     :param input: Int (indicating camera to take stream from), file, or dir .  Script args.input.
     :return: Video capture stream (vcap), and frames per sec delay.
     """
-    print(f">> initializeInput({type(input)} {input})")
+    lh.logfunc(initializeInput, locals())
     if input == 'cam':
         return initializeVidStreamInput(input)
     elif input == 'dir':
@@ -110,6 +106,7 @@ def initializeInput(input):
     else:
         return initializeImageFileInput(input)
 def initializeVidStreamInput(input):
+    lh.logfunc(initializeVidStreamInput, locals())
     print(f">> initializeVidStreamInput({type(input)} {input});")
     input_stream = 0
     print(f"...initializing camera stream ({type(input_stream)} {input_stream})")
@@ -130,6 +127,7 @@ def initializeVidStreamInput(input):
         print(e)
         return None, None
 def initializeDirOfImagesInput(input):
+    lh.logfunc(initializeDirOfImagesInput, locals())
     try:
         print(f"> initializeDirOfImagesInput({type(input)} {input})")    
         assert os.path.isfile(input), "Specified input file doesn't exist"
@@ -145,6 +143,7 @@ def initializeDirOfImagesInput(input):
         print(e)
         return None, None
 def initializeImageFileInput(input):
+    lh.logfunc(initializeImageFileInput, locals())
     try:
         print(f"> initializeImageFileInput({type(input)} {input})")
         assert os.path.isfile(input), "Specified input file doesn't exist"
@@ -167,8 +166,9 @@ def message_runner():
     Pauses for rate second(s) between updates
     :return: None
     """
-    while KEEP_RUNNING:
-        payload = json.dumps({"Shopper": INFO.shopper, "Looker": INFO.looker, "Session": INFO.session, "totalSessions": INFO.totalSessions})
+    global STATE
+    while STATE.KEEP_RUNNING:
+        payload = json.dumps({"Faces": INFO.faces, "Lookers": INFO.lookers, "Attenders": INFO.attenders, "totalSessions": INFO.totalSessions, "session": INFO.session})
         time.sleep(1)
         CLIENT.publish(TOPIC, payload=payload)
 def getModelOutput(name,model,device,input_size,output_size,num_requests,cpu_extension,plugin=None):
@@ -183,9 +183,9 @@ def getModelOutput(name,model,device,input_size,output_size,num_requests,cpu_ext
         :param plugin: Plugin for specified device
         :return:  Shape of input layer
         """
-        print(f">> getModelOutput(\nname:{name},\nmodel:{model},\ndevice{device},\ninput_size{input_size},\noutput_size{output_size},\n{num_requests},\n{cpu_extension},\n{plugin})")
+        lh.logfunc(getModelOutput, locals())
+        initializeImageFileInput
         infer_network = Network()
-        logfunc(getModelOutput,locals())
         res = {
             'name':name, 'model':model, 'device':device, 'network':infer_network,
             'input_size':input_size, 'output_size':output_size, 'num_requests':num_requests,
@@ -210,7 +210,7 @@ def face_detection(vcap,next_frame,fd): # parse faces from an image
     :return: Co-ordinates of the detected face
     """
     global INFO
-    global DELAY
+    global STATE
     global args
     faces = []
     # Get intial width and height of video stream
@@ -219,7 +219,7 @@ def face_detection(vcap,next_frame,fd): # parse faces from an image
     # Change data layout from HWC to CHW
     in_frame_fd = in_frame_fd.transpose((2, 0, 1))
     in_frame_fd = in_frame_fd.reshape((fd['n'], fd['c'], fd['h'], fd['w']))
-    key_pressed = cv2.waitKey(int(DELAY))
+    key_pressed = cv2.waitKey(int(STATE.DELAY))
 
     # Start asynchronous inference for specified request
     inf_start_fd = time.time()
@@ -244,7 +244,7 @@ def face_detection(vcap,next_frame,fd): # parse faces from an image
             xmax = int(obj[5] * initial_wh[0])
             ymax = int(obj[6] * initial_wh[1])
             faces.append([xmin, ymin, xmax, ymax])
-    return faces
+    return faces,det_time_fd
 def parseLookers(faces,frame,hp): # Parse faces for faces that are looking
     lookingFaces = []
     if faces:
@@ -264,10 +264,9 @@ def parseLookers(faces,frame,hp): # Parse faces for faces that are looking
             angle_y_fc = hp['network'].get_output(0, "angle_y_fc")
             if ((angle_y_fc > -22.5) & (angle_y_fc < 22.5) & (angle_p_fc > -22.5) &
                     (angle_p_fc < 22.5)):
-                looking += 1
                 lookingFaces.append(face)
-    return lookingFaces
-def parseAttenders(lookingFaces,vcap,x_criteria,y_criteria): # Parse looking faces for faces that 
+    return lookingFaces,det_time_hp
+def parseAttenders(lookingFaces,frame,vcap,initial_wh,x_criteria,y_criteria): # Parse looking faces for faces that 
     attendingFaces = []
     frame_wh = [vcap.get(3), vcap.get(4)]
     assert (frame_wh == initial_wh), "Error! frame_wh [{0}] != initial_wh [{1}]".format(frame_wh,initial_wh)
@@ -277,7 +276,7 @@ def parseAttenders(lookingFaces,vcap,x_criteria,y_criteria): # Parse looking fac
             if (xmax-xmin > (frame_wh[0]*x_criteria) or ymax-ymin > (frame_wh[1]*y_criteria)):
                 attendingFaces.append(face)
     return attendingFaces
-def draw_results(frame, faces, det_time_fd, det_time_hp):
+def draw_results(frame,faces,lookingFaces,attendingFaces,det_time_fd,det_time_hp):
     """
     Parse SSD output.
 
@@ -289,9 +288,11 @@ def draw_results(frame, faces, det_time_fd, det_time_hp):
     stats = {
         'texts': [
             "Face Inference time: {:.3f} ms.".format(det_time_fd * 1000),
-            "Shopper: {}".format(INFO.shopper),
-            "Looker: {}".format(INFO.looker),
-            "Sessions: {}".format(INFO.session)
+            "Faces: {}".format(INFO.faces),
+            "Lookers: {}".format(INFO.lookers),
+            "Attenders: {}".format(INFO.attenders),
+            "Total Sessions: {}".format(INFO.totalSessions),
+            "Session: {}".format(INFO.session)
         ]
     }
     styles = { 
@@ -321,7 +322,7 @@ def draw_results(frame, faces, det_time_fd, det_time_hp):
     # Draw on screen messages    
     frame = drawText(frame,stats,styles['text'])
     # Draw boxes
-    drawFaces(frame,faces,styles['boxes'])
+    drawFaces(frame,faces,lookingFaces,attendingFaces,styles['boxes'])
     # update frame
     cv2.imshow("Shopper Gaze Monitor", frame) # Draws above to screen
     return True
@@ -344,11 +345,23 @@ def drawText(frame,stats,styles):
             styles['fontFace'], styles['fontScale'], styles['color'], 
             styles['thickness'], styles['lineStyle'])
     return frame
-def drawFaces(frame,faces, styles):
+def drawFaces(frame,faces,lookingFaces,attendingFaces,styles):
     # Draw boxes around faces
-    for res_hp in faces:
-        xmin, ymin, xmax, ymax = res_hp      
-        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), styles['color'], styles['thickness'])
+    if attendingFaces:
+        for attender in attendingFaces:
+            xmin, ymin, xmax, ymax = attender      
+            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (255,0,0), 5)
+        xmin, ymin, xmax, ymax = 0,0,0,0
+    if lookingFaces:
+        for looker in lookingFaces:
+            xmin, ymin, xmax, ymax = looker      
+            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0,0,255), 3)
+        xmin, ymin, xmax, ymax = 0,0,0,0
+    if faces:
+        for face in faces:
+            xmin, ymin, xmax, ymax = face      
+            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (255,255,255), 1)
+        xmin, ymin, xmax, ymax = 0,0,0,0
     return frame
 def getFaceEmbedding(faceimage):
     faceEmbedding = None
@@ -357,9 +370,9 @@ def getFaceEmbedding(faceimage):
         pass
     return faceEmbedding
 def isNewFace(faceEmbedding):
-    global CURRENT_SESSION_FACE
-    # Check provided face embedding against CURRENT_SESSION_FACE
-    return faceEmbedding != CURRENT_SESSION_FACE
+    global STATE
+    # Check provided face embedding against STATE.CURRENT_SESSION_FACE
+    return faceEmbedding != STATE.CURRENT_SESSION_FACE
 def updateSession(b):
     global INFO
     INFO = INFO._replace(session=b)
@@ -368,10 +381,12 @@ def updateSession(b):
         INFO = INFO._replace(totalSessions=(INFO.totalSessions + 1))
         updateSessionFace(faceimage,faceEmbedding)
 def updateSessionFace(faceimage,faceEmbedding):
-    global CURRENT_SESSION_FACEIMAGE
-    global CURRENT_SESSION_FACE
-    CURRENT_SESSION_FACEIMAGE = faceimage
-    CURRENT_SESSION_FACE = getFaceEmbedding(faceimage)
+    global STATE
+    STATE = STATE._replace(
+        CURRENT_SESSION_FACEIMAGE=faceimage,
+        CURRENT_SESSION_FACE=getFaceEmbedding(faceimage)
+    )
+    
 def showSessionFace(faceimage):
     global OUTPUT_DIR
     print(f"...showing session face.")
@@ -419,62 +434,47 @@ def processFace(faceimage):
 
 def processFrame(vcap,next_frame,fd,hp): # process a frame of a vcap
     global INFO
-    global DELAY
+    global STATE
     global args
     det_time_hp = None
     frame = next_frame
+    initial_wh = [vcap.get(3), vcap.get(4)]
+    key_pressed = cv2.waitKey(int(STATE.DELAY))
     # Parse face detection output
-    faces = face_detection(vcap,next_frame,fd)
-    INFO = INFO._replace(shopper=len(faces))    
-
+    faces,det_time_fd = face_detection(vcap,next_frame,fd)
+    INFO = INFO._replace(faces=len(faces))    
     if len(faces) > 0:
 
         # Look for faces that are looking at the camera
-        lookingFaces = parseLookers(faces)
+        lookingFaces,det_time_hp = parseLookers(faces,frame,hp)
         INFO = INFO._replace(lookers=len(lookingFaces))
         
         # Check for attending faces (looker is more than 75% of the camera h or w)
         x_criteria = 0.75
         y_criteria = 0.75
-        attendingFaces = parseAttenders(lookingFaces,vcap,x_criteria,y_criteria)
+        attendingFaces = parseAttenders(lookingFaces,frame,vcap,initial_wh,x_criteria,y_criteria)
         INFO = INFO._replace(lookers=len(attendingFaces))
         
         # Check whether a new session should be started
         #session = needNewSession(INFO.session,frame,face,frame_wh)
-        updateSession(session)
-
+        # updateSession(session)
+    else:
+        faces,lookingFaces,attendingFaces = [],[],[]
     # Draw performance stats
-    draw_results(frame, faces, det_time_fd, det_time_hp)
-    # Draw performance stats
-    draw_results(frame, faces, det_time_fd, det_time_hp)
-
-        # for face in faces:
-        #     # filter faces for faces that are looking
-        #     # lookingFaces = filterFacesForLookingFaces(faces)
-
-        #     xmin, ymin, xmax, ymax = face
-        #     head_pose = frame[ymin:ymax, xmin:xmax]
-        #     in_frame_hp = cv2.resize(head_pose, (hp['w'], hp['h']))
-        #     in_frame_hp = in_frame_hp.transpose((2, 0, 1))
-        #     in_frame_hp = in_frame_hp.reshape((hp['n'], hp['c'], hp['h'], hp['w']))
-        #     inf_start_hp = time.time()
-        #     hp['network'].exec_net(0, in_frame_hp)
-        #     hp['network'].wait(0)
-        #     det_time_hp = time.time() - inf_start_hp
-
-        #     # Parse head pose detection results
-        #     angle_p_fc = hp['network'].get_output(0, "angle_p_fc")
-        #     angle_y_fc = hp['network'].get_output(0, "angle_y_fc")
-        #     if ((angle_y_fc > -22.5) & (angle_y_fc < 22.5) & (angle_p_fc > -22.5) &
-        #             (angle_p_fc < 22.5)):
-        #         looking += 1
-        #         # check to see if a new session should be started
-        #         #session = needNewSession(INFO.session,frame,face,frame_wh)
-        #         res = False
-        #     else:
-        #         pass        
-
-    return next_frame, faces, key_pressed
+    draw_results(frame,faces,lookingFaces,attendingFaces,det_time_fd,det_time_hp)    
+    STATE = STATE._replace(FRAMES_SINCE_LAST_LOG = STATE.FRAMES_SINCE_LAST_LOG +1)
+    if STATE.FRAMES_SINCE_LAST_LOG >= STATE.FRAMES_TO_WAIT_BETWEEN_LOGS:
+        print(".")
+        print("...")
+        print(".....")
+        print(f"...logging session state after {STATE.FRAMES_SINCE_LAST_LOG} frames:")
+        print(STATE)
+        print(INFO)
+        print(".....")
+        print("...")
+        print(".")
+        STATE = STATE._replace(FRAMES_SINCE_LAST_LOG = 0)
+    return next_frame, key_pressed
 
 def initilizeModels(device,paths):
     print(f"...initializing models")
@@ -522,42 +522,29 @@ def main():
     global INFO
     global DELAY
     global CLIENT
-    global KEEP_RUNNING
     global POSE_CHECKED 
     global args
     global PATH
+    global STATE
     # CLIENT = mqtt.Client()
     # CLIENT.connect(MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL)
     # log.basicConfig(format="[ %(levelname)s ] %(message)s",
     #                 level=log.INFO, stream=sys.stdout)
     args = args_parser().parse_args()
     # if video stream, Establish video stream
-    vcap, DELAY = initializeInput(args.input)
+    vcap, delay = initializeInput(args.input)
+    STATE = STATE._replace(DELAY=delay)
     ret, frame = vcap.read()
+    
     # Initialize the class
-
     fd,hp,ri = initilizeModels(args.device,PATH)
-
-    # models = initilizeModels(args,MODEL_PATHS)
-    # print(f"...initializing {model['fd']['name']} with model: {model['fd']['model']}")
-    # fd = getModelOutput(**model['fd']['model']) # {name,model,device,network,up1,up2,up3,cpu_extension,plugin,n,c,h,w,}
-    # print(f"...initializing {model['hp']['name']} with model: {model['hp']['model']}")
-    # hp = getModelOutput(**model['hp'][model]) # {name,model,device,network,up1,up2,up3,cpu_extension,plugin,n,c,h,w,}
-    # print(f"...initializing {model['ri']['name']} with model: {model['ri']['model']}")
-    # ri = getModelOutput(**model['ri']['model']) # {name,model,device,network,up1,up2,up3,cpu_extension,plugin,n,c,h,w,}
-
-    # print(f"...initializing {hpmodel['name']} with model: {hpmodel['model']}")
-    # hp = getModelOutput(**hpmodel) # {name,model,device,network,up1,up2,up3,cpu_extension,plugin,n,c,h,w,}
-    # print(f"...initializing {rimodel['name']} with model: {rimodel['model']}")
-    # ri = getModelOutput(**rimodel) # {name,model,device,network,up1,up2,up3,cpu_extension,plugin,n,c,h,w,}
-
 
     # mqtt stuff
     # message_thread = Thread(target=message_runner)
     # message_thread.setDaemon(True)
     # message_thread.start()
     
-    INFO = INFO._replace(sessions=False)
+    INFO = INFO._replace(session=False)
 
     # Main vid loop.  Repeats for each frame
     while ret:
@@ -565,18 +552,19 @@ def main():
         ret, next_frame = vcap.read()
         
         if not ret:
-            KEEP_RUNNING = False
+            STATE = STATE._replace(KEEP_RUNNING=False)
             break
 
         if next_frame is None:
-            KEEP_RUNNING = False
+            STATE = STATE._replace(KEEP_RUNNING=False)
             log.error("ERROR! blank FRAME grabbed")
             break  
-        next_frame,faces,key_pressed = processFrame(vcap,next_frame,fd,hp)
+
+        next_frame,key_pressed = processFrame(vcap,next_frame,fd,hp)
 
         if key_pressed == 27:
             print("Attempting to stop background threads")
-            KEEP_RUNNING = False
+            STATE = STATE._replace(KEEP_RUNNING=False)
             break
 
     fd['network'].clean()
