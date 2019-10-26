@@ -25,6 +25,7 @@ import sys
 import json
 import time
 import cv2
+import numpy as np
 # from cbhelpers import log-helper as logger
 
 import logging as log
@@ -62,7 +63,16 @@ def intializeMQTT():  # Set up and return MQTT global variables
     return (TOPIC, MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL)
 #TOPIC, MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL = intializeMQTT(): # Set up MQTT server environment variables
 MyState = namedtuple("MyState", "KEEP_RUNNING, DELAY, FRAMES_SINCE_LAST_LOG, FRAMES_TO_WAIT_BETWEEN_LOGS, CURRENT_SESSION_FACE, CURRENT_SESSION_FACEIMAGE")
-STATE = MyState(True,5,0,100,None,None) # STATE holds vars to control background thread
+# paths to image dirs
+def intializeSTATE():
+    KEEP_RUNNING = True
+    DELAY = 5
+    FRAMES_SINCE_LAST_LOG = 0
+    FRAMES_TO_WAIT_BETWEEN_LOGS = 100
+    CURRENT_SESSION_FACE = []
+    CURRENT_SESSION_FACEIMAGE = []
+    return MyState(KEEP_RUNNING, DELAY, FRAMES_SINCE_LAST_LOG, FRAMES_TO_WAIT_BETWEEN_LOGS, CURRENT_SESSION_FACE, CURRENT_SESSION_FACEIMAGE)
+STATE = intializeSTATE() # STATE holds vars to control background thread
 logger = log.getLogger() 
 
 def args_parser():
@@ -171,6 +181,7 @@ def message_runner():
         payload = json.dumps({"Faces": INFO.faces, "Lookers": INFO.lookers, "Attenders": INFO.attenders, "totalSessions": INFO.totalSessions, "session": INFO.session})
         time.sleep(1)
         CLIENT.publish(TOPIC, payload=payload)
+
 def getModelOutput(name,model,device,input_size,output_size,num_requests,cpu_extension,plugin=None):
         """
          Loads a network and an image to the Inference Engine plugin.
@@ -201,6 +212,19 @@ def getModelOutput(name,model,device,input_size,output_size,num_requests,cpu_ext
                                             plugin)  #TODO figure out what this plugin param does.
         print(f"...inference results for {name}: {res}")
         return res
+def getFaceImage(face,frame):
+        xmin, ymin, xmax, ymax = face
+        faceImage = frame[ymin:ymax, xmin:xmax]
+        return faceImage
+def getImageHW(img):
+    height, width, channels = img.shape
+    return {'h':height, 'w':width, 'channels':channels}
+def isImage(faceImage):
+    try:
+        shape = faceImage.shape
+        return True
+    except:
+        return False
 def face_detection(vcap,next_frame,fd): # parse faces from an image
     """
     Parse Face detection output.
@@ -212,7 +236,7 @@ def face_detection(vcap,next_frame,fd): # parse faces from an image
     global INFO
     global STATE
     global args
-    faces = []
+    faces,det_time_fd = [],0
     # Get intial width and height of video stream
     initial_wh = [vcap.get(3), vcap.get(4)]
     in_frame_fd = cv2.resize(next_frame, (fd['w'], fd['h']))
@@ -246,7 +270,7 @@ def face_detection(vcap,next_frame,fd): # parse faces from an image
             faces.append([xmin, ymin, xmax, ymax])
     return faces,det_time_fd
 def parseLookers(faces,frame,hp): # Parse faces for faces that are looking
-    lookingFaces = []
+    lookingFaces,det_time_hp = [],0
     if faces:
         for face in faces:
             xmin, ymin, xmax, ymax = face
@@ -276,6 +300,39 @@ def parseAttenders(lookingFaces,frame,vcap,initial_wh,x_criteria,y_criteria): # 
             if (xmax-xmin > (frame_wh[0]*x_criteria) or ymax-ymin > (frame_wh[1]*y_criteria)):
                 attendingFaces.append(face)
     return attendingFaces
+def getFaceEmbedding(faceimage,fe):
+    """
+    Convert face image to face embedding.
+    :param faceImage: Cropped image of face
+    :param ri: Face Reidentification model
+    :return: Facial embedding
+    """
+    faceEmbedding,det_time_fe = [],0
+    global STATE
+
+    if faceimage.size > 0:  #generate face embedding from image
+
+        # Get intial width and height of video stream
+        initial_wh = getImageHW(faceimage)
+        in_frame_fe = cv2.resize(faceimage, (fe['w'], fe['h']))
+        # Change data layout from HWC to CHW
+        in_frame_fe = in_frame_fe.transpose((2, 0, 1))
+        in_frame_fe = in_frame_fe.reshape((fe['n'], fe['c'], fe['h'], fe['w']))
+        key_pressed = cv2.waitKey(int(STATE.DELAY))
+
+        # Start asynchronous inference for specified request
+        inf_start_fe = time.time()
+        fe['network'].exec_net(0, in_frame_fe)
+
+        # Wait for the result
+        fe['network'].wait(0)
+        det_time_fe = time.time() - inf_start_fe
+
+        # Results of the output layer of the network
+        faceEmbedding = fe['network'].get_output(0) #plugin
+
+    return faceEmbedding,det_time_fe
+
 def draw_results(frame,faces,lookingFaces,attendingFaces,det_time_fd,det_time_hp):
     """
     Parse SSD output.
@@ -323,6 +380,8 @@ def draw_results(frame,faces,lookingFaces,attendingFaces,det_time_fd,det_time_hp
     frame = drawText(frame,stats,styles['text'])
     # Draw boxes
     drawFaces(frame,faces,lookingFaces,attendingFaces,styles['boxes'])
+    # Draw embeddings
+    #drawEmbeddings(frame,embeddings)
     # update frame
     cv2.imshow("Shopper Gaze Monitor", frame) # Draws above to screen
     return True
@@ -350,25 +409,53 @@ def drawFaces(frame,faces,lookingFaces,attendingFaces,styles):
     if attendingFaces:
         for attender in attendingFaces:
             xmin, ymin, xmax, ymax = attender      
-            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (255,0,0), 5)
-        xmin, ymin, xmax, ymax = 0,0,0,0
-    if lookingFaces:
-        for looker in lookingFaces:
-            xmin, ymin, xmax, ymax = looker      
-            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0,0,255), 3)
-        xmin, ymin, xmax, ymax = 0,0,0,0
+            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0,255,0), 5)
     if faces:
         for face in faces:
             xmin, ymin, xmax, ymax = face      
             cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (255,255,255), 1)
-        xmin, ymin, xmax, ymax = 0,0,0,0
+    if lookingFaces:
+        for looker in lookingFaces:
+            xmin, ymin, xmax, ymax = looker      
+            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (255,0,0), 1)
     return frame
-def getFaceEmbedding(faceimage):
-    faceEmbedding = None
-    if faceimage:
-        #generate face embedding from image
-        pass
-    return faceEmbedding
+def drawEmbeddings(frame,embeddings):
+    radius = 3
+    color = (0,255,0)
+    thickness = -1
+    for e in embeddings:
+        center_coordinates = (e[0],e[1])
+        cv2.circle(frame, center_coordinates, radius, color, thickness)
+    return frame
+def logFrame(faces,lookingFaces,attendingFaces):
+    global STATE
+    global INFO
+    # INFO("shoppingInfo", "faces, lookers, attenders, totalSessions, session")
+    # STATE("MyState", "KEEP_RUNNING, DELAY, FRAMES_SINCE_LAST_LOG, FRAMES_TO_WAIT_BETWEEN_LOGS, CURRENT_SESSION_FACE, CURRENT_SESSION_FACEIMAGE")
+
+    # update FRAMES_SINCE_LAST_LOG
+    STATE = STATE._replace(FRAMES_SINCE_LAST_LOG = STATE.FRAMES_SINCE_LAST_LOG +1)
+
+    # log frame
+    if STATE.FRAMES_SINCE_LAST_LOG >= STATE.FRAMES_TO_WAIT_BETWEEN_LOGS:
+        print("")
+        print(".")
+        print("...")
+        print(".....")
+        print(f"...logging session state after {STATE.FRAMES_SINCE_LAST_LOG} frames:")
+        print(".")
+        print(f"[{len(faces)==INFO.faces}] len(faces) {len(faces)} == INFO.faces {INFO.faces};")
+        print(f"[{len(lookingFaces)==INFO.lookers}] len(lookingFaces) {len(lookingFaces)} == INFO.lookingFaces {INFO.lookers};; ")
+        print(f"[{len(attendingFaces)==INFO.attenders}] len(attendingFaces) {len(attendingFaces)} == INFO.attendingFaces {INFO.attenders};")
+        print(".")
+        print(f"[{len(STATE.CURRENT_SESSION_FACE)}] len(STATE.CURRENT_SESSION_FACE);")
+        showSessionFace(STATE.CURRENT_SESSION_FACEIMAGE)
+        print(".....")
+        print("...")
+        print(".")
+        STATE = STATE._replace(FRAMES_SINCE_LAST_LOG = 0)
+
+
 def isNewFace(faceEmbedding):
     global STATE
     # Check provided face embedding against STATE.CURRENT_SESSION_FACE
@@ -380,30 +467,31 @@ def updateSession(b):
         # print("INFO.totalSessions: {0} {1}; INFO.sessions: {2} {3}; ".format(type(INFO.totalSessions),INFO.totalSessions,type(INFO.sessions),INFO.sessions))
         INFO = INFO._replace(totalSessions=(INFO.totalSessions + 1))
         updateSessionFace(faceimage,faceEmbedding)
-def updateSessionFace(faceimage,faceEmbedding):
+def updateSessionFace(faceEmbedding,faceimage):
     global STATE
     STATE = STATE._replace(
-        CURRENT_SESSION_FACEIMAGE=faceimage,
-        CURRENT_SESSION_FACE=getFaceEmbedding(faceimage)
+        CURRENT_SESSION_FACE=faceEmbedding,
+        CURRENT_SESSION_FACEIMAGE=faceimage
     )
-    
 def showSessionFace(faceimage):
-    global OUTPUT_DIR
-    print(f"...showing session face.")
-    cv2.imwrite("Session Face",faceimage)
-    cv2.imshow('Session Face',faceimg)
-    cv2.moveWindow('Session Face',200,200)
+    #TODO: Write face to STATE.OUTPUT_DIR
+    if isImage(faceimage):
+        print(f"...showing session face.")
+        cv2.imwrite("SessionFace.jpg",faceimage)
+        wn = "Session Face"
+        cv2.namedWindow(wn)
+        cv2.moveWindow(wn,700,200)
+        cv2.imshow(wn,faceimage)
+    else:
+        print(f"...no current session face.")
 def needNewSession(session,frame,face,frame_wh):
     res = False
-    xmin, ymin, xmax, ymax = face
-    attending = (xmax-xmin > (frame_wh[0]*0.50) or ymax-ymin > (frame_wh[1]*0.50))
     if session and not attending: # check if session is abandoned (no face)
         print(f"...session:{session}, attending:{attending}.  Clearing session.")
         updateSessionFace(None)
         res = True
     elif not session and attending:
         print(f"...session:{session}, attending:{attending}.  Starting new session.")
-        processFace(frame[ymin:ymax, xmin:xmax])
         res = True
     elif not session and not attending:  # do nothing
         res = False
@@ -432,7 +520,7 @@ def processFace(faceimage):
     else:
         print(f"WARNING: unhandled case in ")
 
-def processFrame(vcap,next_frame,fd,hp): # process a frame of a vcap
+def processFrame(vcap,next_frame,fd,hp,fe): # process a frame of a vcap
     global INFO
     global STATE
     global args
@@ -442,38 +530,53 @@ def processFrame(vcap,next_frame,fd,hp): # process a frame of a vcap
     key_pressed = cv2.waitKey(int(STATE.DELAY))
     # Parse face detection output
     faces,det_time_fd = face_detection(vcap,next_frame,fd)
-    INFO = INFO._replace(faces=len(faces))    
-    if len(faces) > 0:
 
-        # Look for faces that are looking at the camera
-        lookingFaces,det_time_hp = parseLookers(faces,frame,hp)
-        INFO = INFO._replace(lookers=len(lookingFaces))
+    # Look for faces that are looking at the camera
+    lookingFaces,det_time_hp = parseLookers(faces,frame,hp)
+    
+    # Check for attending faces (looker is more than 75% of the camera h or w)
+    x_criteria = 0.25
+    y_criteria = 0.50
+    attendingFaces = parseAttenders(lookingFaces,frame,vcap,initial_wh,x_criteria,y_criteria)
+    
+    needNewSession = True
+    if(attendingFaces):
+        fes = []
+        for face in attendingFaces:
+            faceImage = getFaceImage(face,frame)
+            fes.append( {'embedding':getFaceEmbedding(faceImage,fe), 'image':faceImage} )
+        for fe in fes:
+            # if STATE.CURRENT_SESSION_FACE != fe['embedding']:
+            if True: #TODO: Need a function to return cosine similarity of 2 embeddings
+                needNewSession == False
+                print(f"...len(fe['embedding']):{len(fe['embedding'])}")
+                print(f"...len(fe['image']):{len(fe['image'])}")
+                # print(fe)
+
+                showSessionFace(fe['image'])
+                break
+            else:
+                updateSessionFace(fe['embedding'],fe['image'])
+                pass
+        if needNewSession:
+            pass
+
         
-        # Check for attending faces (looker is more than 75% of the camera h or w)
-        x_criteria = 0.75
-        y_criteria = 0.75
-        attendingFaces = parseAttenders(lookingFaces,frame,vcap,initial_wh,x_criteria,y_criteria)
-        INFO = INFO._replace(lookers=len(attendingFaces))
-        
-        # Check whether a new session should be started
-        #session = needNewSession(INFO.session,frame,face,frame_wh)
-        # updateSession(session)
-    else:
-        faces,lookingFaces,attendingFaces = [],[],[]
+
+    # Check whether a new session should be started
+    #session = needNewSession(INFO.session,frame,face,frame_wh)
+    # updateSession(session)
+
+    #update INFO
+    INFO = INFO._replace(
+        faces=len(faces),
+        lookers=len(lookingFaces),
+        attenders=len(attendingFaces)
+    )
     # Draw performance stats
     draw_results(frame,faces,lookingFaces,attendingFaces,det_time_fd,det_time_hp)    
-    STATE = STATE._replace(FRAMES_SINCE_LAST_LOG = STATE.FRAMES_SINCE_LAST_LOG +1)
-    if STATE.FRAMES_SINCE_LAST_LOG >= STATE.FRAMES_TO_WAIT_BETWEEN_LOGS:
-        print(".")
-        print("...")
-        print(".....")
-        print(f"...logging session state after {STATE.FRAMES_SINCE_LAST_LOG} frames:")
-        print(STATE)
-        print(INFO)
-        print(".....")
-        print("...")
-        print(".")
-        STATE = STATE._replace(FRAMES_SINCE_LAST_LOG = 0)
+    # log frames stats
+    logFrame(faces,lookingFaces,attendingFaces)
     return next_frame, key_pressed
 
 def initilizeModels(device,paths):
@@ -501,7 +604,7 @@ def initilizeModels(device,paths):
     hp = getModelOutput(**hpmodel) # {name,model,device,network,up1,up2,up3,cpu_extension,plugin,n,c,h,w,}
 
     rimodel = {
-        'name':'ri',
+        'name':'fe',
         'model':paths.FACE_REID,
         'device':device,
         'input_size':1, 'output_size':1, 'num_requests':0,
@@ -537,7 +640,7 @@ def main():
     ret, frame = vcap.read()
     
     # Initialize the class
-    fd,hp,ri = initilizeModels(args.device,PATH)
+    fd,hp,fe = initilizeModels(args.device,PATH)
 
     # mqtt stuff
     # message_thread = Thread(target=message_runner)
@@ -560,7 +663,7 @@ def main():
             log.error("ERROR! blank FRAME grabbed")
             break  
 
-        next_frame,key_pressed = processFrame(vcap,next_frame,fd,hp)
+        next_frame,key_pressed = processFrame(vcap,next_frame,fd,hp,fe)
 
         if key_pressed == 27:
             print("Attempting to stop background threads")
