@@ -22,6 +22,7 @@
 
 import os, os.path
 import sys
+import math
 import json
 import time
 import cv2
@@ -62,16 +63,18 @@ def intializeMQTT():  # Set up and return MQTT global variables
     MQTT_KEEPALIVE_INTERVAL = 60
     return (TOPIC, MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL)
 #TOPIC, MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL = intializeMQTT(): # Set up MQTT server environment variables
-MyState = namedtuple("MyState", "KEEP_RUNNING, DELAY, FRAMES_SINCE_LAST_LOG, FRAMES_TO_WAIT_BETWEEN_LOGS, CURRENT_SESSION_FACE, CURRENT_SESSION_FACEIMAGE")
+MyState = namedtuple("MyState", "SESSION, KEEP_RUNNING, DELAY, FRAMES_SINCE_LAST_LOG, FRAMES_TO_WAIT_BETWEEN_LOGS, CURRENT_SESSION_FACE, CURRENT_SESSION_FACEIMAGE, CURRENT_SESSION_FACE_LOCATION")
 # paths to image dirs
 def intializeSTATE():
+    SESSION = False
     KEEP_RUNNING = True
     DELAY = 5
     FRAMES_SINCE_LAST_LOG = 0
     FRAMES_TO_WAIT_BETWEEN_LOGS = 100
     CURRENT_SESSION_FACE = []
     CURRENT_SESSION_FACEIMAGE = []
-    return MyState(KEEP_RUNNING, DELAY, FRAMES_SINCE_LAST_LOG, FRAMES_TO_WAIT_BETWEEN_LOGS, CURRENT_SESSION_FACE, CURRENT_SESSION_FACEIMAGE)
+    CURRENT_SESSION_FACE_LOCATION = None
+    return MyState(SESSION,KEEP_RUNNING, DELAY, FRAMES_SINCE_LAST_LOG, FRAMES_TO_WAIT_BETWEEN_LOGS, CURRENT_SESSION_FACE, CURRENT_SESSION_FACEIMAGE,CURRENT_SESSION_FACE_LOCATION)
 STATE = intializeSTATE() # STATE holds vars to control background thread
 logger = log.getLogger() 
 
@@ -329,9 +332,34 @@ def getFaceEmbedding(faceimage,fe):
         det_time_fe = time.time() - inf_start_fe
 
         # Results of the output layer of the network
-        faceEmbedding = fe['network'].get_output(0) #plugin
-
+        res = fe['network'].get_output(0) #plugin
+        # print(f"...result of reid model: len(res[0]): {len(res[0])}; res[0][0]): {len(res[0][0])}")
+        faceEmbedding = res[0]
+        checkEmbedding(faceEmbedding)
+        print(f"...fe model returning tuple(faceEmbedding, det_time_fe): ( list with len:{len(faceEmbedding)}, float({det_time_fe}))")
     return faceEmbedding,det_time_fe
+def checkEmbedding(faceEmbedding):
+        # auto numOfChannels = attribsBlob->getTensorDesc().getDims().at(1) 
+        numOfChannels = len(faceEmbedding) # output descriptor of Person Reidentification Recognition network has size 256
+        assert numOfChannels == 256, f"""!!   ERROR! Output size ({numOfChannels}) 
+            of the Person Reidentification network is not equal to 256"""
+        # auto outputValues = attribsBlob->buffer().as<float*>();
+        # return std::vector<float>(outputValues, outputValues + 256);
+def getCosineSimilarity(vec1,vec2):
+    res = None
+    assert len(vec1) == len(vec2), f"""ERROR! cosine similarity can't be called for vectors 
+        of different lengths: len(vec1):{len(vec1)}, len(vec2):{len(vec2)};"""
+    mul, denomA, denomB, A, B = 0,0,0,0,0
+    for i in range(len(vec1)):
+        A = vec1[i]
+        B = vec2[i]
+        mul += A * B
+        denomA += A * A
+        denomB += B * B
+    assert (denomA != 0 and denomB != 0), f"""ERROR! Cosine similarity is not defined whenever 
+        one or both input vectors are zero-vectors. denomA:{denomA}, denomB:{denomB};"""
+    res =  mul / (math.sqrt(denomA) * math.sqrt(denomB))
+    return res
 
 def draw_results(frame,faces,lookingFaces,attendingFaces,det_time_fd,det_time_hp):
     """
@@ -404,20 +432,30 @@ def drawText(frame,stats,styles):
             styles['fontFace'], styles['fontScale'], styles['color'], 
             styles['thickness'], styles['lineStyle'])
     return frame
+def drawFaceBox(frame,face,color,thickness):
+    xmin, ymin, xmax, ymax = face      
+    cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, thickness)
+    return frame 
 def drawFaces(frame,faces,lookingFaces,attendingFaces,styles):
     # Draw boxes around faces
     if attendingFaces:
         for attender in attendingFaces:
-            xmin, ymin, xmax, ymax = attender      
-            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0,255,0), 5)
+            color = (0,255,0)
+            thickness = 5
+            drawFaceBox(frame,attender,color,thickness)
     if faces:
         for face in faces:
-            xmin, ymin, xmax, ymax = face      
-            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (255,255,255), 1)
+            color = (255,255,255)
+            thickness = 1
+            drawFaceBox(frame,face,color,thickness)
     if lookingFaces:
         for looker in lookingFaces:
-            xmin, ymin, xmax, ymax = looker      
-            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (255,0,0), 1)
+            color = (255,0,0)
+            thickness = 1
+            drawFaceBox(frame,looker,color,thickness)
+    if STATE.SESSION:
+        showFace(STATE.CURRENT_SESSION_FACEIMAGE)
+        drawFaceBox(frame,STATE.CURRENT_SESSION_FACE_LOCATION,(0,0,255),3)
     return frame
 def drawEmbeddings(frame,embeddings):
     radius = 3
@@ -449,12 +487,11 @@ def logFrame(faces,lookingFaces,attendingFaces):
         print(f"[{len(attendingFaces)==INFO.attenders}] len(attendingFaces) {len(attendingFaces)} == INFO.attendingFaces {INFO.attenders};")
         print(".")
         print(f"[{len(STATE.CURRENT_SESSION_FACE)}] len(STATE.CURRENT_SESSION_FACE);")
-        showSessionFace(STATE.CURRENT_SESSION_FACEIMAGE)
+        showFace(STATE.CURRENT_SESSION_FACEIMAGE)
         print(".....")
         print("...")
         print(".")
         STATE = STATE._replace(FRAMES_SINCE_LAST_LOG = 0)
-
 
 def isNewFace(faceEmbedding):
     global STATE
@@ -467,13 +504,14 @@ def updateSession(b):
         # print("INFO.totalSessions: {0} {1}; INFO.sessions: {2} {3}; ".format(type(INFO.totalSessions),INFO.totalSessions,type(INFO.sessions),INFO.sessions))
         INFO = INFO._replace(totalSessions=(INFO.totalSessions + 1))
         updateSessionFace(faceimage,faceEmbedding)
-def updateSessionFace(faceEmbedding,faceimage):
+def updateSessionFace(embedding,image,location):
     global STATE
     STATE = STATE._replace(
-        CURRENT_SESSION_FACE=faceEmbedding,
-        CURRENT_SESSION_FACEIMAGE=faceimage
+        CURRENT_SESSION_FACE=embedding,
+        CURRENT_SESSION_FACEIMAGE=image,
+        CURRENT_SESSION_FACE_LOCATION=location
     )
-def showSessionFace(faceimage):
+def showFace(faceimage):
     #TODO: Write face to STATE.OUTPUT_DIR
     if isImage(faceimage):
         print(f"...showing session face.")
@@ -484,42 +522,30 @@ def showSessionFace(faceimage):
         cv2.imshow(wn,faceimage)
     else:
         print(f"...no current session face.")
-def needNewSession(session,frame,face,frame_wh):
-    res = False
-    if session and not attending: # check if session is abandoned (no face)
-        print(f"...session:{session}, attending:{attending}.  Clearing session.")
-        updateSessionFace(None)
-        res = True
-    elif not session and attending:
-        print(f"...session:{session}, attending:{attending}.  Starting new session.")
-        res = True
-    elif not session and not attending:  # do nothing
-        res = False
-    elif session and attending:  # start a new session
-        res = False
-    else:
-        pass
-    return res
-def processFace(faceimage):
-    print(f"...processing face")
-    return False
-    global FACE_DIR
-    global OUTPUT_DIR
-    faceEmbedding = processFace(faceimage)
-    showSessionFace(faceimage)
-    updateSessionFace(faceimage,faceEmbedding)
-    if isNewFace(faceEmbedding):
-        print(f"...new face. Starting new session.")
-        facecount = len([name for name in os.listdir(OUTPUT_DIR) if os.path.isfile(name)])
-        if facecount < 10: # TODO: Remove this  when face embeddings works
-            cv2.imwrite(f"{OUTPUT_DIR}/face_{facecount}.jpg", faceimage)
-            print(f"...writing new face to: \"{OUTPUT_DIR}/face_{facecount}.jpg\"")
-        else:
-            print(f"...too many faces!")
-        res = True
-    else:
-        print(f"WARNING: unhandled case in ")
-
+def sessionFaceInList(sessionFaceEmbedding,presentFaceEmbeddings,threshold):
+    for fe in presentFaceEmbeddings:
+        cosSim = getCosineSimilarity(sessionFaceEmbedding,fe['embedding'])
+        if cosSim > threshold: # face is the same as session face
+            # {'embedding':embedding[0], 'det_time_fe':embedding[1], 'image':faceImage, 'location':face}
+            print(f"found cosineSimilarity ({cosSim}) above threshhold ({threshhold}).  Continuing session.")
+            return True, fe
+        else: #face is different than session face
+            pass
+    print(f"...failed to find sessionFace in present faces.")    
+    return False, None
+def beginSession(embedding,image,location):
+    global STATE
+    print("...starting a new session session.")
+    clearSession()
+    updateSessionFace(embedding,image,location)
+    STATE = STATE._replace(SESSION=True)
+    #TODO: Broadcast that a session should begin
+def clearSession():
+    global STATE
+    print("...clearing current session.")
+    STATE = STATE._replace(SESSION=False)
+    updateSessionFace(None,None,None)
+    #TODO: Broadcast that session should be ended  
 def processFrame(vcap,next_frame,fd,hp,fe): # process a frame of a vcap
     global INFO
     global STATE
@@ -528,44 +554,48 @@ def processFrame(vcap,next_frame,fd,hp,fe): # process a frame of a vcap
     frame = next_frame
     initial_wh = [vcap.get(3), vcap.get(4)]
     key_pressed = cv2.waitKey(int(STATE.DELAY))
+    endSession = True
+    faces, lookingFaces, attendingFaces = [],[],[]
+
     # Parse face detection output
     faces,det_time_fd = face_detection(vcap,next_frame,fd)
-
-    # Look for faces that are looking at the camera
-    lookingFaces,det_time_hp = parseLookers(faces,frame,hp)
-    
-    # Check for attending faces (looker is more than 75% of the camera h or w)
-    x_criteria = 0.25
-    y_criteria = 0.50
-    attendingFaces = parseAttenders(lookingFaces,frame,vcap,initial_wh,x_criteria,y_criteria)
-    
-    needNewSession = True
-    if(attendingFaces):
-        fes = []
-        for face in attendingFaces:
-            faceImage = getFaceImage(face,frame)
-            fes.append( {'embedding':getFaceEmbedding(faceImage,fe), 'image':faceImage} )
-        for fe in fes:
-            # if STATE.CURRENT_SESSION_FACE != fe['embedding']:
-            if True: #TODO: Need a function to return cosine similarity of 2 embeddings
-                needNewSession == False
-                print(f"...len(fe['embedding']):{len(fe['embedding'])}")
-                print(f"...len(fe['image']):{len(fe['image'])}")
-                # print(fe)
-
-                showSessionFace(fe['image'])
-                break
-            else:
-                updateSessionFace(fe['embedding'],fe['image'])
-                pass
-        if needNewSession:
-            pass
-
+    if faces:
+        # Look for faces that are looking at the camera
+        lookingFaces,det_time_hp = parseLookers(faces,frame,hp)
         
+        # Check for attending faces (looker is more than 75% of the camera h or w)
+        x_criteria = 0.25
+        y_criteria = 0.50
+        attendingFaces = parseAttenders(lookingFaces,frame,vcap,initial_wh,x_criteria,y_criteria)
+    
+        if attendingFaces:
+            fes = []
+            for face in attendingFaces:
+                faceImage = getFaceImage(face,frame)
+                embedding = getFaceEmbedding(faceImage,fe)
+                fes.append( {'id':'01', 'embedding':embedding[0], 'det_time_fe':embedding[1], 'image':faceImage, 'location':face} )
+                # TODO: Convert face emdbeddings from a dict to struct (namedtuple)
+            threshold = 0.5 #TODO: threshhold should be a top level parameter
+            firstFace = fes[0] #TODO: This feels unelegant
 
-    # Check whether a new session should be started
-    #session = needNewSession(INFO.session,frame,face,frame_wh)
-    # updateSession(session)
+            if STATE.SESSION:
+                sessionFacePresent, sessionFace = sessionFaceInList(STATE.CURRENT_SESSION_FACE,fes,0.6)
+                if sessionFacePresent:
+                    print("...sessionFace in fes.  Doing nothing.")
+                    STATE=STATE._replace(CURRENT_SESSION_FACE_LOCATION = sessionFace['location'])
+                    endSession = False
+                else:
+                    print("...sessionFace not in fes. Updating session face.")
+                    beginSession(firstFace['embedding'],firstFace['image'],firstFace['location']) # clear current session and start a new one
+                    endSession = False     
+            else:
+                print("...attending face while no current session.  Starting a new session.")                
+                beginSession(firstFace['embedding'],firstFace['image'],firstFace['location']) # clear current session and start a new one
+                endSession = False
+
+    if STATE.SESSION and endSession:
+        clearSession()
+
 
     #update INFO
     INFO = INFO._replace(
